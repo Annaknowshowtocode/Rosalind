@@ -1,10 +1,8 @@
 import os
-import time
-import ssl
 import logging
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from Bio.Blast import NCBIWWW, NCBIXML
+from Bio.Blast import NCBIXML
 
 # Настроим логирование ошибок
 logging.basicConfig(filename="blast_errors.log", level=logging.ERROR, format="%(asctime)s - %(message)s")
@@ -12,108 +10,89 @@ logging.basicConfig(filename="blast_errors.log", level=logging.ERROR, format="%(
 # Определяем пути
 script_dir = os.path.dirname(os.path.abspath(__file__))
 blast_results_path = os.path.join(script_dir, "blast_results")
-file_path = os.path.join(script_dir, "output_table.csv")
-
-# Создадим папку для BLAST-результатов, если её нет
 os.makedirs(blast_results_path, exist_ok=True)
 
-# Загрузка данных
+# Читаем входной файл
+file_path = os.path.join(script_dir, "output_table.csv")
 df = pd.read_csv(file_path) if file_path.endswith(".csv") else pd.read_excel(file_path, engine="openpyxl")
-
-# Получаем последовательности
-df = df.dropna(subset=["oligo_sequence"]).reset_index(drop=True)
-sequences = df["oligo_sequence"].iloc[:100]
+df = df.dropna(subset=["oligo_sequence"]).iloc[3:40].reset_index(drop=True)  # Выбираем строки 3-40
 
 
-# Функция для перевода последовательности в мРНК
-def get_mRNA(sequence):
-    complement = {"A": "U", "T": "A", "C": "G", "G": "C", "a" : "u", "t" : "a", "c" : "g", "g" : "c"}
-    return "".join(complement.get(nuc.upper(), "") for nuc in sequence)
+# Функция для проверки, является ли транскрипт предсказанным
+def is_predicted(hit_id):
+    return any(prefix in hit_id for prefix in ["XP_", "XM_"])
 
 
-# Функция для запуска BLAST-запроса
-def run_blast(sequence, index, retries=3):
-    delay = 3
-    for attempt in range(retries):
-        try:
-            print(f"🔎 Запрос BLAST {index + 1}/{len(sequences)} (Попытка {attempt + 1})...")
-            time.sleep(delay)
-
-            result_handle = NCBIWWW.qblast(
-                program="blastn",
-                database="refseq_rna",
-                sequence=sequence,
-                entrez_query="Homo sapiens[organism]",
-                hitlist_size=1,
-                expect=0.05,
-                format_type="XML"
-            )
-
-            result_data = result_handle.read()
-            blast_file = os.path.join(blast_results_path, f"blast_result_{index}.xml")
-            with open(blast_file, "w") as save_file:
-                save_file.write(result_data)
-            return blast_file
-        except Exception as e:
-            logging.error(f"Ошибка BLAST {index}, попытка {attempt + 1}: {e}")
-            time.sleep(delay)
-            delay *= 2
-    return None
-
-
-# Функция для парсинга результатов BLAST
-def parse_blast_results(blast_file):
-    if not blast_file or not os.path.exists(blast_file):
-        return ["NA"] * 3
-
-    with open(blast_file) as result_handle:
+# Функция для обработки BLAST-результатов
+def parse_blast_result(file):
+    with open(file) as result_handle:
         blast_record = NCBIXML.read(result_handle)
 
     if not blast_record.alignments:
-        return ["NA"] * 3
+        return None
 
     top_hit = blast_record.alignments[0]
-    hsp = top_hit.hsps[0]
+    top_hit_id = top_hit.hit_id
+    is_top_predicted = is_predicted(top_hit_id)
 
-    return [
-        top_hit.title,  # top1_hit
-        hsp.identities / hsp.align_length,  # top1_real
-        hsp.expect  # top1_predicted
-    ]
+    top_metrics = {
+        "top1_hit": top_hit_id,
+        "top1_score": top_hit.hsps[0].score,
+        "top1_evalue": top_hit.hsps[0].expect,
+        "top1_identity": top_hit.hsps[0].identities / top_hit.hsps[0].align_length,
+        "top1_predicted": is_top_predicted
+    }
+
+    # Ищем первое вхождение target-гена
+    match_hit = None
+    match_rank = None
+    for i, alignment in enumerate(blast_record.alignments, start=1):
+        if "target_gene" in alignment.hit_def:  # <- Уточнить критерий
+            match_hit = alignment
+            match_rank = i
+            break
+
+    match_metrics = {}
+    if match_hit:
+        match_metrics = {
+            "match_hit": match_hit.hit_id,
+            "match_score": match_hit.hsps[0].score,
+            "match_evalue": match_hit.hsps[0].expect,
+            "match_identity": match_hit.hsps[0].identities / match_hit.hsps[0].align_length,
+            "match_rank": match_rank,
+            "match_predicted": is_predicted(match_hit.hit_id)
+        }
+
+    return {**top_metrics, **match_metrics}
 
 
-# Запуск BLAST в многопоточном режиме
-def process_sequence(index, seq):
-    try:
-        mRNA_seq = get_mRNA(seq.strip())
-        if not mRNA_seq:
-            return [index, "NA", "NA", "NA"]
+# Список файлов с результатами BLAST
+blast_files = [os.path.join(blast_results_path, f) for f in os.listdir(blast_results_path) if f.endswith(".xml")]
 
-        blast_file = run_blast(mRNA_seq, index)
-        return [index] + parse_blast_results(blast_file)
-    except Exception as e:
-        logging.error(f"Ошибка при обработке последовательности {index}: {e}")
-        return [index, "ERROR", "ERROR", "ERROR"]
-
-
-# Выполняем BLAST для каждой последовательности
-num_threads = min(2, len(sequences))
+# Парсим результаты
 results = []
-with ThreadPoolExecutor(max_workers=num_threads) as executor:
-    future_to_index = {executor.submit(process_sequence, i, seq): i for i, seq in enumerate(sequences)}
-    for future in as_completed(future_to_index):
+with ThreadPoolExecutor() as executor:
+    future_to_file = {executor.submit(parse_blast_result, file): file for file in blast_files}
+    for future in as_completed(future_to_file):
         try:
-            results.append(future.result())
+            result = future.result()
+            if result:
+                results.append(result)
         except Exception as e:
-            logging.error(f"Ошибка выполнения потока: {e}")
+            logging.error(f"Ошибка при обработке {future_to_file[future]}: {e}")
 
-# Добавляем результаты в DataFrame
-for res in results:
-    index, top1_hit, top1_real, top1_predicted = res
-    df.at[index, "top1_hit"] = top1_hit
-    df.at[index, "top1_real"] = top1_real
-    df.at[index, "top1_predicted"] = top1_predicted
+# Создаем DataFrame с результатами
+blast_df = pd.DataFrame(results)
 
-# Сохраняем обновленный файл
-df.to_csv(file_path, index=False, na_rep="NA")
-print(f"\n✅ Файл обновлен с результатами BLAST: {file_path}")
+# Разделяем на предсказанные / реальные
+blast_df_real = blast_df[blast_df["top1_predicted"] == False].add_suffix("_real")
+blast_df_pred = blast_df[blast_df["top1_predicted"] == True].add_suffix("_predicted")
+
+# Объединяем
+final_df = pd.concat([df, blast_df_real, blast_df_pred], axis=1)
+
+# Сохраняем
+final_output = os.path.join(script_dir, "blast_parsed_results.csv")
+final_df.to_csv(final_output, index=False)
+
+print(f"Результаты сохранены в {final_output}")

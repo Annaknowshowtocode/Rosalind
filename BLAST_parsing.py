@@ -28,7 +28,9 @@ for index, row in df.iterrows():
 
     # Выполнение BLAST
     blast_output = f"blast_result_{index}.xml"
-    blast_cmd = f"blastn -query {fasta_filename} -db refseq_rna -out {blast_output} -outfmt 5 -max_target_seqs 1 -evalue 0.01"
+    blast_cmd = "/opt/homebrew/bin/blastn -query {} -db refseq_rna -out {} -outfmt 5 -max_target_seqs 1 -evalue 0.01".format(
+        fasta_filename, blast_output
+    )
     subprocess.run(blast_cmd, shell=True)
 
     # Чтение результатов BLAST
